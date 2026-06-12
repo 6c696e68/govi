@@ -89,11 +89,17 @@ final class VietTelex {
         let lo = VC.toLower(ch)
         raw.append(ch)
 
+        // Dấu thanh chỉ đặt được lên nguyên âm. Phím dấu (f/s/r/x/j/z) chỉ được coi là
+        // "dấu" khi buffer đã có nguyên âm; chưa có nguyên âm (vd "j" trong "json",
+        // "rs" trong "rss") thì nó là chữ literal, KHÔNG được gỡ/đặt lại dấu — nếu không
+        // sẽ nuốt ký tự đứng trước của từ tiếng Anh.
+        let hasVowel = text.contains { VC.isVowel(VC.stripTone($0)) }
+
         // Gõ lại dấu: nếu ký tự cuối là phím dấu thừa của lần trước (vd "tichx"),
         // bỏ nó để đặt lại dấu cho đúng -> "tích", khỏi xoá hết.
         // Nhưng nếu spam ĐÚNG phím dấu vừa nhả ra (vd "ki" + r + r + r...), thì các
         // lần sau chỉ thêm ký tự thường, KHÔNG bật lại dấu (tránh toggle dấu).
-        if VC.toneIndex(lo) >= 0, let last = text.last, VC.toneIndex(VC.toLower(last)) >= 0 {
+        if hasVowel, VC.toneIndex(lo) >= 0, let last = text.last, VC.toneIndex(VC.toLower(last)) >= 0 {
             if VC.toLower(last) == lo {
                 text.append(ch)
                 return
@@ -273,11 +279,14 @@ final class VietTelex {
         }
         if vc > 1 && (lastV - firstV >= vc) { return false }
 
-        // Validate trước khi đặt dấu: âm tiết sai cấu trúc (vd "đưing") -> trả false
-        // để phím dấu nhả ra thành chữ ("đưing"+f = "đưingf").
+        // Chuẩn hoá u/ư + o/ơ -> ươ trên BẢN SAO rồi validate; chỉ commit vào text khi
+        // âm tiết hợp lệ. Commit vô điều kiện sẽ phá từ tiếng Anh có "uo" sinh ra do đặt
+        // dấu (vd "aurora": "ảuo" -> "ảươ" rồi rớt dấu thành "aươrar").
+        let norm = Self.normalizedUoToUow(text)
         var struc: [Character] = []
-        for c in text { struc.append(VC.toLower(VC.stripTone(c))) }
+        for c in norm { struc.append(VC.toLower(VC.stripTone(c))) }
         if !Self.isCompleteSyllable(struc) { return false }
+        text = norm
 
         var currentTone = 0, tonePos = -1
         for i in 0..<text.count {
@@ -293,7 +302,29 @@ final class VietTelex {
             text[tonePos] = VC.stripTone(text[tonePos]); toneIndex = -1; return false
         }
 
-        // Auto uo -> ươ khi bấm dấu thanh
+        // Auto uo -> ươ đã chuẩn hoá ở normalizeUoToUow() phía trên.
+
+        let target = (tonePos >= 0) ? tonePos : findTonePosition()
+        if target >= 0 {
+            let orig = text[target]
+            let up = orig.isUppercase
+            let base = VC.stripTone(orig)
+            if let toned = VC.toneMark(base, ti) {
+                text[target] = up ? Character(String(toned).uppercased()) : toned
+                toneIndex = ti
+                return true
+            }
+        }
+        return false
+    }
+
+    // MARK: - Normalize uo/ưo -> ươ
+
+    /// Trả về bản sao đã chuẩn hoá cụm u/ư + o/ơ thành ươ (giữ nguyên dấu thanh nếu có).
+    /// Ngoại lệ uơ cho th/h/q không phụ âm cuối (vd "thuở", "quở"). Chỉ đụng cặp nguyên
+    /// âm đầu tiên. Hàm thuần, KHÔNG sửa text — caller tự quyết có commit hay không.
+    private static func normalizedUoToUow(_ src: [Character]) -> [Character] {
+        var text = src
         var i = 0
         while i < text.count - 1 {
             let v1 = VC.toLower(VC.stripTone(text[i]))
@@ -313,36 +344,25 @@ final class VietTelex {
                     } else if p1 == "q" { uoException = true }
                 }
                 let up1 = text[i].isUppercase, up2 = text[i + 1].isUppercase
+                let t1 = VC.toneOf(text[i]), t2 = VC.toneOf(text[i + 1])
+                func toned(_ b: Character, _ t: Int) -> Character { t > 0 ? (VC.toneMark(b, t) ?? b) : b }
                 if uoException {
                     if !(v1 == "u" && v2 == "ơ") {
-                        text[i] = up1 ? "U" : "u"; text[i + 1] = up2 ? "Ơ" : "ơ"; tonePos = -1
+                        text[i] = toned(up1 ? "U" : "u", t1); text[i + 1] = toned(up2 ? "Ơ" : "ơ", t2)
                     }
                 } else {
                     if !(v1 == "ư" && v2 == "ơ") {
-                        text[i] = up1 ? "Ư" : "ư"; text[i + 1] = up2 ? "Ơ" : "ơ"; tonePos = -1
+                        text[i] = toned(up1 ? "Ư" : "ư", t1); text[i + 1] = toned(up2 ? "Ơ" : "ơ", t2)
                     }
                 }
                 break
             }
             i += 1
         }
-
-        let target = (tonePos >= 0) ? tonePos : findTonePosition()
-        if target >= 0 {
-            let orig = text[target]
-            let up = orig.isUppercase
-            let base = VC.stripTone(orig)
-            if let toned = VC.toneMark(base, ti) {
-                text[target] = up ? Character(String(toned).uppercased()) : toned
-                toneIndex = ti
-                return true
-            }
-        }
-        return false
+        return text
     }
 
     // MARK: - Find tone position
-
     private func findTonePosition() -> Int {
         if text.isEmpty { return -1 }
         var first = -1, last = -1, count = 0
