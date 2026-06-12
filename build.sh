@@ -30,7 +30,12 @@ swiftc -O -wmo -target arm64-apple-macos14.0 \
   $(find Sources -name '*.swift')
 
 strip -x "$APP/Contents/MacOS/$APP_NAME"
-codesign --force --options runtime --sign "$GOVI_SIGN_ID" "$APP"
+# Developer ID cần secure timestamp để notarize; ad-hoc ("-") thì không gắn timestamp.
+if [[ "$GOVI_SIGN_ID" == "-" ]]; then
+  codesign --force --options runtime --sign "-" "$APP"
+else
+  codesign --force --options runtime --timestamp --sign "$GOVI_SIGN_ID" "$APP"
+fi
 echo "Built $APP ($(du -h "$APP/Contents/MacOS/$APP_NAME" | cut -f1))"
 
 # 2) Tạo .dmg có shortcut /Applications để kéo-thả cài đặt

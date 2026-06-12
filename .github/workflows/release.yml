@@ -11,6 +11,10 @@ permissions:
 jobs:
   build:
     runs-on: macos-14
+    env:
+      # true khi đã nạp đủ secrets ký + notarize; nếu thiếu sẽ fallback ad-hoc.
+      HAS_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.NOTARY_KEY_P8_BASE64 != '' }}
+      KEYCHAIN_PATH: ${{ runner.temp }}/govi-signing.keychain-db
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,13 +25,62 @@ jobs:
       - name: Run engine tests
         run: bash test/run.sh
 
-      - name: Build app + dmg (ad-hoc sign)
+      # Nạp chứng chỉ Developer ID + thông tin notary từ secrets vào keychain tạm.
+      # Không echo bất kỳ giá trị bí mật nào ra log.
+      - name: Import signing certificate & notary credentials
+        if: env.HAS_SIGNING == 'true'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          NOTARY_KEY_PATH="$RUNNER_TEMP/notary.p8"
+
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          echo "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$NOTARY_KEY_PATH"
+
+          # Keychain tạm, đặt làm mặc định để codesign + notarytool đều dùng.
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+
+          # Lưu hồ sơ notary (App Store Connect API key) vào keychain tạm.
+          xcrun notarytool store-credentials govi-notary \
+            --key "$NOTARY_KEY_PATH" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --keychain "$KEYCHAIN_PATH"
+
+          rm -f "$CERT_PATH" "$NOTARY_KEY_PATH"
+
+      - name: Build, sign & notarize
+        if: env.HAS_SIGNING == 'true'
+        env:
+          GOVI_SIGN_ID: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          GOVI_NOTARY_PROFILE: govi-notary
+        run: bash build.sh
+
+      - name: Build (ad-hoc, no signing secrets)
+        if: env.HAS_SIGNING != 'true'
         env:
           GOVI_SIGN_ID: '-'
         run: bash build.sh
 
       - name: Rename dmg with version
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           mv build/Govi.dmg "build/Govi-${VERSION}.dmg"
 
@@ -35,8 +88,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$HAS_SIGNING" == "true" ]]; then
+            NOTE="Bản dựng tự động ${GITHUB_REF_NAME}, ký Developer ID + notarize (mở chạy thẳng)."
+          else
+            NOTE="Bản dựng tự động ${GITHUB_REF_NAME}, ký ad-hoc (chưa notarize) — lần đầu mở: chuột phải Govi.app → Open."
+          fi
           gh release create "${GITHUB_REF_NAME}" \
             "build/Govi-${VERSION}.dmg" \
             --title "Govi ${VERSION}" \
-            --notes "Bản dựng tự động cho ${GITHUB_REF_NAME}. Ký ad-hoc (chưa notarize) — lần đầu mở: chuột phải Govi.app → Open."
+            --notes "$NOTE"
+
+      - name: Cleanup keychain
+        if: always() && env.HAS_SIGNING == 'true'
+        run: security delete-keychain "$KEYCHAIN_PATH" || true
