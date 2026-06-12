@@ -11,10 +11,6 @@ permissions:
 jobs:
   build:
     runs-on: macos-14
-    env:
-      # true khi đã nạp đủ secrets ký + notarize; nếu thiếu sẽ fallback ad-hoc.
-      HAS_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.NOTARY_KEY_P8_BASE64 != '' }}
-      KEYCHAIN_PATH: ${{ runner.temp }}/govi-signing.keychain-db
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,10 +21,26 @@ jobs:
       - name: Run engine tests
         run: bash test/run.sh
 
+      # secrets KHÔNG truy cập được ở jobs.<job>.env — phải xác định ở step.
+      # Đặt has=true khi đã nạp đủ secrets ký + notarize; nếu thiếu -> ad-hoc.
+      - name: Detect signing config
+        id: signing
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          NOTARY_P8: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${CERT_P12}" && -n "${NOTARY_P8}" ]]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "KEYCHAIN_PATH=$RUNNER_TEMP/govi-signing.keychain-db" >> "$GITHUB_ENV"
+
       # Nạp chứng chỉ Developer ID + thông tin notary từ secrets vào keychain tạm.
       # Không echo bất kỳ giá trị bí mật nào ra log.
       - name: Import signing certificate & notary credentials
-        if: env.HAS_SIGNING == 'true'
+        if: steps.signing.outputs.has == 'true'
         env:
           MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -66,14 +78,14 @@ jobs:
           rm -f "$CERT_PATH" "$NOTARY_KEY_PATH"
 
       - name: Build, sign & notarize
-        if: env.HAS_SIGNING == 'true'
+        if: steps.signing.outputs.has == 'true'
         env:
           GOVI_SIGN_ID: ${{ secrets.MACOS_SIGN_IDENTITY }}
           GOVI_NOTARY_PROFILE: govi-notary
         run: bash build.sh
 
       - name: Build (ad-hoc, no signing secrets)
-        if: env.HAS_SIGNING != 'true'
+        if: steps.signing.outputs.has != 'true'
         env:
           GOVI_SIGN_ID: '-'
         run: bash build.sh
@@ -87,6 +99,7 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          HAS_SIGNING: ${{ steps.signing.outputs.has }}
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
@@ -101,5 +114,5 @@ jobs:
             --notes "$NOTE"
 
       - name: Cleanup keychain
-        if: always() && env.HAS_SIGNING == 'true'
+        if: always() && steps.signing.outputs.has == 'true'
         run: security delete-keychain "$KEYCHAIN_PATH" || true
