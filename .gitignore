@@ -1,0 +1,12 @@
+# Build artifacts
+build/
+Govi.app/
+*.dmg
+
+# macOS
+.DS_Store
+
+docs/
+.agents/
+skills-lock.json
+.playwright-mcp/

@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Run engine tests
+        run: bash test/run.sh
+
+      - name: Build app + dmg (ad-hoc sign)
+        env:
+          GOVI_SIGN_ID: '-'
+        run: bash build.sh
+
+      - name: Rename dmg with version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mv build/Govi.dmg "build/Govi-${VERSION}.dmg"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "${GITHUB_REF_NAME}" \
+            "build/Govi-${VERSION}.dmg" \
+            --title "Govi ${VERSION}" \
+            --notes "Bản dựng tự động cho ${GITHUB_REF_NAME}. Ký ad-hoc (chưa notarize) — lần đầu mở: chuột phải Govi.app → Open."
