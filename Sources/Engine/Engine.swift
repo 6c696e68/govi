@@ -8,13 +8,23 @@ final class VietTelex {
     private var toneIndex: Int = -1
     private var lastOutput: [Character] = []
 
+    /// Bật khi phát hiện chuỗi không phải tiếng Việt (vd hai phím dấu liền nhau):
+    /// phần còn lại của từ giữ nguyên literal tới khi kết từ. Reset ở reset().
+    private var literalMode = false
+
     var autoRestore = true
+
+    /// Gõ tự do (free-style): cho phép đặt dấu mũ aa/ee/oo SAU phụ âm cuối, vd
+    /// "nguyenex"->nguyễn, "vietje"->việt. Tắt đi để giữ Telex chặt (mũ phải gõ
+    /// liền nguyên âm), thân thiện hơn khi xen lẫn từ tiếng Anh.
+    var freeStyleMarks = true
 
     func reset() {
         raw.removeAll(keepingCapacity: true)
         text.removeAll(keepingCapacity: true)
         lastOutput.removeAll(keepingCapacity: true)
         toneIndex = -1
+        literalMode = false
     }
 
     /// Nạp 1 ký tự -> (xoá, chèn) so với lần render trước.
@@ -30,13 +40,17 @@ final class VietTelex {
         // Nếu đã escape (gõ dấu đôi) thành text không dấu thì giữ nguyên, không bung lại raw
         // -> "gorri"->"gori", "kirr"->"kir" (Telex thuần, gộp dấu đôi).
         if !raw.isEmpty, autoRestore, VC.hasVietMark(text[...]) {
-            var textLo: [Character] = []
+            var textLo: [Character] = []      // giữ mũ/móc -> validate cấu trúc âm tiết
+            var textAscii: [Character] = []   // ascii thuần -> dò tiếng Anh
             for c in text {
                 let s = VC.toLower(VC.stripTone(c))
-                if VC.isAlpha(s) || s == "đ" || VC.isVowel(s) { textLo.append(s) }
+                if VC.isAlpha(s) || s == "đ" || VC.isVowel(s) {
+                    textLo.append(s)
+                    textAscii.append(VC.toLower(VC.stripToneAndAccent(c)))
+                }
             }
             if !textLo.isEmpty, !Self.isCompleteSyllable(textLo) {
-                if Self.isLikelyEnglish(textLo) {
+                if Self.isLikelyEnglish(textAscii) {
                     result = (text.count, String(raw))               // tiếng Anh -> raw thô
                 } else if let demoted = demoteToneToLiteral() {
                     result = (text.count, demoted)                   // "đừing" -> "đưingf"
@@ -89,11 +103,36 @@ final class VietTelex {
         let lo = VC.toLower(ch)
         raw.append(ch)
 
+        // Đã xác định không phải tiếng Việt -> phần còn lại của từ giữ literal.
+        if literalMode { text.append(ch); return }
+
         // Dấu thanh chỉ đặt được lên nguyên âm. Phím dấu (f/s/r/x/j/z) chỉ được coi là
         // "dấu" khi buffer đã có nguyên âm; chưa có nguyên âm (vd "j" trong "json",
         // "rs" trong "rss") thì nó là chữ literal, KHÔNG được gỡ/đặt lại dấu — nếu không
         // sẽ nuốt ký tự đứng trước của từ tiếng Anh.
         let hasVowel = text.contains { VC.isVowel(VC.stripTone($0)) }
+
+        // Hai phím dấu thanh KHÁC NHAU gõ liền nhau (phím raw ngay trước cũng là phím
+        // dấu): tiếng Việt không có (mỗi âm tiết chỉ 1 thanh) -> đây là tiếng Anh, nhả
+        // cả buffer về đúng chuỗi đã gõ thay vì "đổi dấu". Vd "vers" (r+s) -> "vers",
+        // "verrs" (r+r đã undo + s) -> "verrs", "users" (r+s) -> "users".
+        // Phím dấu LẶP cùng loại (rr/ss) vẫn là undo, không vào đây (prevKey == lo).
+        if hasVowel, VC.toneIndex(lo) >= 0, raw.count >= 2 {
+            let prevKey = VC.toLower(raw[raw.count - 2])
+            if VC.toneIndex(prevKey) >= 0, prevKey != lo {
+                // Còn dấu -> phím dấu trước ĐẶT dấu (vd "vers", "users"): dựng lại từ raw
+                // để khôi phục phím dấu đã bị "ăn" vào thanh.
+                // Hết dấu -> phím dấu trước là UNDO (vd gõ lại "r" để gỡ "vẻ" -> "ver"):
+                // chỉ nối phím hiện tại vào text, tránh nhân đôi phím undo ("verrs"->"vers").
+                if VC.hasVietMark(text[...]) {
+                    text = raw
+                } else {
+                    text.append(ch)
+                }
+                literalMode = true
+                return
+            }
+        }
 
         // Gõ lại dấu: nếu ký tự cuối là phím dấu thừa của lần trước (vd "tichx"),
         // bỏ nó để đặt lại dấu cho đúng -> "tích", khỏi xoá hết.
@@ -113,6 +152,10 @@ final class VietTelex {
         let isHook = (lo == "w")
 
         if !bypass, isDouble, !text.isEmpty, applyDoubleKeys(ch) { applied = true }
+        // Free-style mũ vẫn thử cả khi bị bypass: hàm tự validate (chỉ commit nếu ra
+        // âm tiết hoàn chỉnh) nên không phá từ tiếng Anh, nhưng cứu được ca mà phụ âm
+        // cuối khiến buffer chưa hợp lệ, vd "benhe"->bênh ("e"+nh bắt buộc có mũ).
+        if bypass, !applied, freeStyleMarks, isDouble, !text.isEmpty, applyDoubleFreeStyle(ch) { applied = true }
         if !bypass, !applied, isHook, !text.isEmpty, applyHookKeys(ch) { applied = true }
         if !bypass, !applied {
             let ti = VC.toneIndex(lo)
@@ -140,6 +183,69 @@ final class VietTelex {
     // MARK: - Apply double keys (aa/ee/oo/dd)
 
     private func applyDoubleKeys(_ key: Character) -> Bool {
+        if applyDoubleAdjacent(key) { return true }
+        if freeStyleMarks, applyDoubleFreeStyle(key) { return true }
+        return false
+    }
+
+    /// Free-style: mũ aa/ee/oo gõ SAU phụ âm cuối. Quét lùi qua phụ âm (giống
+    /// applyHookKeys) tới nguyên âm đầu tiên; chỉ đặt mũ khi nguyên âm đó khớp phím
+    /// và kết quả là âm tiết hoàn chỉnh, nếu không trả về để xử như ký tự thường.
+    private func applyDoubleFreeStyle(_ key: Character) -> Bool {
+        let loKey = VC.toLower(key)
+        guard loKey == "a" || loKey == "e" || loKey == "o" else { return false }
+        var j = text.count - 1
+        while j >= 0 {
+            let target = text[j]
+            let base = VC.stripTone(target)
+            if VC.isVowel(base) {
+                // 'â'/'ô'/'ơ' (đã có mũ/móc) -> loBase khác loKey -> không đụng (undo
+                // chỉ làm ở bản liền trước). Nguyên âm đầu tiên không khớp -> literal.
+                guard VC.toLower(base) == loKey else { return false }
+
+                // Không bridge freestyle qua 1 phụ âm cuối đơn (c/m/n/p/t) khi âm tiết
+                // CÓ phụ âm đầu: phụ âm đơn đóng âm tiết mạnh, nguyên âm kế gần như
+                // chắc chắn bắt đầu phần mới (vd "data", "camo", "banana").
+                // Nếu KHÔNG có phụ âm đầu (vd "ama"->âm, "ana"->ân) thì cho phép
+                // freestyle — đây là case gõ tắt hợp lệ.
+                // Bridge qua cụm ≥2 phụ âm (ng/nh/ch) luôn cho phép (vd "benhe"->bênh).
+                let consonantsAfter = text.count - 1 - j
+                if consonantsAfter == 1, j > 0, !VC.isVowel(VC.stripTone(text[0])) {
+                    let fc = VC.toLower(VC.stripTone(text[j + 1]))
+                    if fc == "c" || fc == "m" || fc == "n" || fc == "p" || fc == "t" {
+                        return false
+                    }
+                }
+                let up = base.isUppercase
+                let tone = VC.toneOf(target)
+                let circ: Character
+                switch loKey {
+                case "a": circ = up ? "Â" : "â"
+                case "e": circ = up ? "Ê" : "ê"
+                default:  circ = up ? "Ô" : "ô"
+                }
+                let newCh = tone > 0 ? (VC.toneMark(circ, tone) ?? circ) : circ
+                func strip(_ t: [Character]) -> [Character] { t.map { VC.toLower(VC.stripTone($0)) } }
+                let saved = text
+                text[j] = newCh
+                if Self.isCompleteSyllable(strip(text)) { return true }
+                // Dấu thanh gõ TRƯỚC mũ bị kẹt thành ký tự cuối (f/s/r/x/j không bao giờ
+                // là phụ âm cuối tiếng Việt) -> gỡ ra, đặt mũ xong đặt lại dấu đúng chỗ,
+                // vd "benhje"->bệnh, "echse"->ếch.
+                if let last = text.last, VC.toneIndex(VC.toLower(last)) > 0 {
+                    let tk = VC.toneIndex(VC.toLower(last))
+                    text.removeLast()
+                    if Self.isCompleteSyllable(strip(text)), applyToneMarks(tk) { return true }
+                }
+                text = saved
+                return false
+            }
+            j -= 1
+        }
+        return false
+    }
+
+    private func applyDoubleAdjacent(_ key: Character) -> Bool {
         let loKey = VC.toLower(key)
         // Telex: aa/ee/oo/dd chỉ ghép với ký tự LIỀN TRƯỚC (quét cả buffer sẽ ghép
         // bắc cầu sai: academic->âc, ngoeo->ngôe).

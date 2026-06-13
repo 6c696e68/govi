@@ -17,6 +17,9 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private var enabled = true   // chỉ truy cập trên thread của tap
     private var debugLog = false // log gõ phím; chỉ truy cập trên thread của tap
+    private var freeStyle = true // gõ tự do (đặt dấu cuối từ); truy cập trên thread tap
+
+    private static let freeStyleKey = "govi.freeStyleMarks"
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // Chặn chạy nhiều bản.
@@ -24,9 +27,22 @@ final class AppController: NSObject, NSApplicationDelegate {
         if NSRunningApplication.runningApplications(withBundleIdentifier: me).count > 1 {
             NSApp.terminate(nil); return
         }
+        // Nạp tuỳ chọn đã lưu (mặc định bật nếu chưa từng đặt).
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: Self.freeStyleKey) != nil {
+            freeStyle = defaults.bool(forKey: Self.freeStyleKey)
+        }
+        parser.freeStyleMarks = freeStyle
         statusBar.onToggle = { [weak self] in self?.toggleMode() }
+        statusBar.onToggleFreeStyle = { [weak self] in self?.toggleFreeStyle() }
         statusBar.onToggleDebug = { [weak self] in self?.toggleDebug() }
+        statusBar.setFreeStyle(enabled: freeStyle)
         LoginItem.enableOnce()
+        if ProcessInfo.processInfo.environment["GOVI_DEBUG"] == "1"
+            || CommandLine.arguments.contains("--debug") {
+            debugLog = true
+            DebugLog.shared.start()
+        }
         if Accessibility.isTrusted { startEngine() }
         else { Accessibility.prompt(); waitForAccessibility() }
     }
@@ -56,6 +72,21 @@ final class AppController: NSObject, NSApplicationDelegate {
             self.enabled.toggle()
             self.parser.reset()
             self.refreshStatus()
+        }
+    }
+
+    /// Bật/tắt gõ tự do (đặt dấu mũ sau phụ âm cuối). Chạy trên thread tap để
+    /// serialize với xử lý phím; lưu lựa chọn vào UserDefaults.
+    private func toggleFreeStyle() {
+        keyTap.perform { [weak self] in
+            guard let self else { return }
+            self.freeStyle.toggle()
+            let on = self.freeStyle
+            self.parser.freeStyleMarks = on
+            self.parser.reset()
+            UserDefaults.standard.set(on, forKey: Self.freeStyleKey)
+            NSLog("Govi free-style: %@", on ? "ON" : "OFF")
+            DispatchQueue.main.async { [weak self] in self?.statusBar.setFreeStyle(enabled: on) }
         }
     }
 
@@ -103,9 +134,22 @@ final class AppController: NSObject, NSApplicationDelegate {
                 parser.reset(); return event
             }
             let code = event.getIntegerValueField(.keyboardEventKeycode)
+            if debugLog {
+                let ar = event.getIntegerValueField(.keyboardEventAutorepeat)
+                let ud = event.getIntegerValueField(.eventSourceUserData)
+                let chs = character(of: event).map { String($0) } ?? "?"
+                DebugLog.shared.log("RAW keyDown code=\(code) char='\(chs)' autorepeat=\(ar) userData=\(ud)")
+            }
             if code == 51 { parser.backspace(); return event } // Backspace
 
             if let ch = character(of: event), ch.isASCII, ch.isLetter {
+                // Auto-repeat (giữ phím / nhịp giữ tự nhiên): KHÔNG đưa vào engine. Mỗi
+                // keyDown lặp lại nếu xử như lần gõ mới sẽ làm phím dấu (r/s/x...) tự
+                // undo/đổi dấu -> "version" hoá "verrsion". Nuốt luôn cho khỏi lặp ký tự.
+                if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 {
+                    if debugLog { DebugLog.shared.log("key '\(ch)' [autorepeat] -> bỏ qua") }
+                    return nil
+                }
                 let r = parser.input(ch)
                 if debugLog {
                     NSLog("Govi key '%@' -> delete=%d insert='%@'", String(ch), r.delete, r.insert)
@@ -125,7 +169,13 @@ final class AppController: NSObject, NSApplicationDelegate {
                 DebugLog.shared.log("break '\(brk)' -> delete=\(r.delete) insert='\(r.insert)'")
             }
             if let bc = character(of: event), let a = bc.asciiValue, a >= 0x20, a < 0x7F {
-                // Space/dấu câu/số: inject đồng bộ cùng phần khôi phục để giữ đúng thứ tự
+                // Không có gì để khôi phục (buffer rỗng / từ đã hợp lệ) -> để phím native
+                // đi qua tự nhiên. Tự inject lại số/dấu câu qua HID sẽ kích hoạt auto-format
+                // của các field đặc biệt (vd ô nhập số thẻ) làm nuốt/thay thế ký tự.
+                if r.delete == 0, r.insert.isEmpty {
+                    return event
+                }
+                // Có khôi phục: inject đồng bộ cùng ký tự ngắt để giữ đúng thứ tự
                 // (tránh đua giữa phím native và text inject qua HID).
                 injector.inject(delete: r.delete, insert: r.insert + String(bc), proxy: proxy)
                 return nil
