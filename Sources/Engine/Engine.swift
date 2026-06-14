@@ -405,7 +405,12 @@ final class VietTelex {
             return false
         }
         if currentTone == ti {
-            text[tonePos] = VC.stripTone(text[tonePos]); toneIndex = -1; return false
+            // Gõ lại ĐÚNG phím dấu vừa đặt = "gỡ dấu". Đây là tín hiệu mạnh người dùng
+            // không muốn dấu ở từ này (tiếng Anh): bỏ dấu + giữ literal phần còn lại của
+            // từ. Vd "trans"(s gỡ sắc)+action -> "transaction", "ver"(r gỡ hỏi)+sion.
+            text[tonePos] = VC.stripTone(text[tonePos]); toneIndex = -1
+            literalMode = true
+            return false
         }
 
         // Auto uo -> ươ đã chuẩn hoá ở normalizeUoToUow() phía trên.

@@ -22,5 +22,5 @@ func trace(_ keys: String) {
     print("  [breakWord] del=\(r.delete) ins='\(r.insert)'  KẾT QUẢ='\(String(buf))'")
 }
 
-let words = ["version", "versions", "reset", "first", "test", "users", "parser", "verrs", "verr", "verrsion"]
+let words = ["version", "verrsion", "transaction", "transsaction", "vers", "users", "toansf"]
 for w in words { trace(w) }
